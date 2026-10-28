@@ -1,5 +1,5 @@
 // LGBrightnessHotkeys : des raccourcis clavier (Ctrl + Volume +/- par défaut) règlent la luminosité
-// d'un LG UltraFine sur 32 crans, en partant toujours de la valeur réelle lue sur l'écran (HID, rapport feature 0).
+// d'un LG UltraFine sur 16 crans, en partant toujours de la valeur réelle lue sur l'écran (HID, rapport feature 0).
 // En option, la luminosité suit le capteur de lumière ambiante de l'écran.
 // Compilation : voir build.ps1 (csc de .NET Framework, C# 5, métadonnées WinRT fournies avec Windows).
 using System;
@@ -171,20 +171,21 @@ namespace LGBrightnessHotkeys
             return Math.Max(RawMin, (int)Math.Round(pct / 100.0 * RawMax));
         }
 
-        // 32 crans de RawMin à RawMax, chacun multipliant la luminosité par (54000 / 400)^(1/32) ≈ 1,166 :
-        // l'œil perçoit les écarts en relatif, donc des pas fins en bas et larges en haut (comme les 16 crans de macOS).
-        public const int Steps = 32;
+        // 16 crans de RawMin à RawMax, comme macOS, chacun multipliant la luminosité par (54000 / 400)^(1/16) ≈ 1,359 :
+        // l'œil perçoit les écarts en relatif, donc des pas fins en bas et larges en haut.
+        // (32 crans en mettaient la moitié sous 8,6 % : trop d'appuis pour remonter.)
+        public const int Steps = 16;
 
         public static int LevelRaw(int level)
         {
             return (int)Math.Round(RawMin * Math.Pow((double)RawMax / RawMin, (double)level / Steps));
         }
 
-        // Valeur brute du cran suivant (dir > 0) ou précédent (dir < 0) ; à un quart de cran près, on est sur le cran.
+        // Valeur brute du cran suivant (dir > 0) ou précédent (dir < 0) ; à 5 % de cran près (arrondis), on est sur le cran.
         public static int NextStep(int raw, int dir)
         {
             double level = Math.Log(Math.Max(raw, 1) / (double)RawMin) / Math.Log((double)RawMax / RawMin) * Steps;
-            const double tol = 0.25;
+            const double tol = 0.05;
             int target = dir > 0 ? (int)Math.Floor(level + tol) + 1 : (int)Math.Ceiling(level - tol) - 1;
             return LevelRaw(Math.Max(0, Math.Min(Steps, target)));
         }

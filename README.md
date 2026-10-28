@@ -1,12 +1,12 @@
 # LG UltraFine Brightness Hotkeys
 
-*English summary: a tiny, dependency-free Windows tray utility that changes the brightness of an LG UltraFine monitor in 32 perceptually even steps with a keyboard shortcut (Ctrl + Volume Up/Down by default, configurable). It talks to the monitor over USB HID, always starts from the monitor's actual brightness, shows a small on-screen indicator, and runs natively on Windows on ARM. Optional automatic brightness follows the monitor's own ambient light sensor and learns from your manual adjustments. Built from a single C# file with the compiler that ships with Windows.*
+*English summary: a tiny, dependency-free Windows tray utility that changes the brightness of an LG UltraFine monitor in 16 perceptually even steps, like macOS, with a keyboard shortcut (Ctrl + Volume Up/Down by default, configurable). It talks to the monitor over USB HID, always starts from the monitor's actual brightness, shows a small on-screen indicator, and runs natively on Windows on ARM. Optional automatic brightness follows the monitor's own ambient light sensor and learns from your manual adjustments. Built from a single C# file with the compiler that ships with Windows.*
 
-Petit utilitaire Windows qui règle la luminosité d'un écran **LG UltraFine** au clavier, sur 32 crans.
+Petit utilitaire Windows qui règle la luminosité d'un écran **LG UltraFine** au clavier, sur 16 crans comme macOS.
 
 - **Ctrl + Volume +** / **Ctrl + Volume −** par défaut, modifiables.
-- **Des crans fins en bas, larges en haut** : chaque appui multiplie la luminosité par environ 1,17, comme les crans de macOS. Exemples : … 8,6 → 10 → 11,7 → 13,7 → 15,9 % … 74 → 86 → 100 %. Chaque appui donne ainsi l'impression du même écart.
-- Chaque appui part de la **luminosité réelle de l'écran**, relue en HID. Une valeur hors cran va au cran voisin : 23 % → 25 % ou 22 %.
+- **Des crans fins en bas, larges en haut** : chaque appui multiplie la luminosité par environ 1,36, comme les crans de macOS. Les crans : 0,7 – 1 – 1,4 – 1,9 – 2,5 – 3,4 – 4,7 – 6,3 – 8,6 – 11,7 – 15,9 – 21,6 – 29,3 – 39,9 – 54 – 74 – 100 %. Chaque appui donne ainsi l'impression du même écart.
+- Chaque appui part de la **luminosité réelle de l'écran**, relue en HID. Une valeur hors cran va au cran voisin : 23 % → 29 % ou 22 %.
 - Maintenir la touche fait défiler.
 - **Luminosité automatique** en option : elle suit le capteur de lumière de l'écran et apprend de vos réglages au clavier.
 - Indicateur discret en bas de l'écran principal (☀ NN % et une barre), qui ne prend pas le focus.
@@ -87,9 +87,11 @@ L'écran ne renvoie la nouvelle valeur que 180 à 360 ms après une écriture. P
 
 ### Crans
 
-Cran `k` (0 à 32) = `round(400 × 135^(k/32))`, où 135 = 54000 / 400. Il y a donc un même rapport (≈ 1,166) entre deux crans voisins. L'œil perçoit la luminosité de façon à peu près logarithmique, donc des pas égaux en pourcentage seraient énormes en bas et imperceptibles en haut.
+Cran `k` (0 à 16) = `round(400 × 135^(k/16))`, où 135 = 54000 / 400. Il y a donc un même rapport (≈ 1,359) entre deux crans voisins. L'œil perçoit la luminosité de façon à peu près logarithmique, donc des pas égaux en pourcentage seraient énormes en bas et imperceptibles en haut.
 
-macOS règle l'écran sur 16 crans, et 64 avec Option + Maj. Le projet [unknownzerx/lguf-brightness](https://github.com/unknownzerx/lguf-brightness) contient deux tables de 16 et 64 crans sur la même plage 400–54000, avec un rapport constant de 1,359 et 1,08. Leur origine n'y est pas documentée ; leur nombre correspond à macOS. 32 crans est un compromis : moins grossier que 16 en haut, plus rapide que 64 à parcourir.
+macOS règle l'écran sur 16 crans, et 64 avec Option + Maj. Le projet [unknownzerx/lguf-brightness](https://github.com/unknownzerx/lguf-brightness) contient deux tables de 16 et 64 crans sur la même plage 400–54000, avec un rapport constant de 1,359 et 1,08. Les crans de l'utilitaire reprennent la table de 16 crans, à 1 près. L'origine de ces tables n'y est pas documentée, mais leur nombre correspond à macOS.
+
+Une version à 32 crans a été essayée : la moitié des crans tombait sous 8,6 %, et remonter de 6 % à 50 % demandait 14 appuis, contre 7 avec 16 crans.
 
 ### Capteur de lumière
 

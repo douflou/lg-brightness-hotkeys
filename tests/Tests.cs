@@ -31,27 +31,29 @@ namespace LGBrightnessHotkeys
         {
             Console.OutputEncoding = System.Text.Encoding.UTF8;
 
-            // 32 crans géométriques de 400 à 54000.
+            // 16 crans géométriques de 400 à 54000, les mêmes valeurs que la table de lguf-brightness.
             Check(LgMonitor.LevelRaw(0) == LgMonitor.RawMin && LgMonitor.LevelRaw(LgMonitor.Steps) == LgMonitor.RawMax, "crans : de 400 à 54000");
+            int[] table = { 0x0190, 0x021f, 0x02e2, 0x03eb, 0x0553, 0x073c, 0x09d5, 0x0d5c, 0x1227, 0x18aa, 0x2184, 0x2d8b, 0x3de2, 0x5415, 0x7240, 0x9b3d, 0xd2f0 };
+            bool sameTable = true;
+            for (int k = 0; k <= LgMonitor.Steps; k++) if (Math.Abs(LgMonitor.LevelRaw(k) - table[k]) > 1) sameTable = false;
+            Check(sameTable, "crans = table de lguf-brightness à 1 près");
             bool even = true, roundTrip = true;
             for (int k = 1; k <= LgMonitor.Steps; k++)
             {
                 double ratio = (double)LgMonitor.LevelRaw(k) / LgMonitor.LevelRaw(k - 1);
-                if (Math.Abs(ratio - 1.166) > 0.005) even = false;
+                if (Math.Abs(ratio - 1.359) > 0.005) even = false;
                 if (LgMonitor.NextStep(LgMonitor.LevelRaw(k - 1), 1) != LgMonitor.LevelRaw(k)) roundTrip = false;
                 if (LgMonitor.NextStep(LgMonitor.LevelRaw(k), -1) != LgMonitor.LevelRaw(k - 1)) roundTrip = false;
             }
-            Check(even, "chaque cran multiplie la luminosité par ≈ 1,166");
+            Check(even, "chaque cran multiplie la luminosité par ≈ 1,359");
             Check(roundTrip, "d'un cran, + et − mènent aux crans voisins");
 
-            // 10 % (valeur des tests précédents) tombe sur un cran : 8,6 % ↔ 10 % ↔ 11,7 %.
+            // Hors cran (10 %, ou après le mode auto) : on va au cran suivant ou précédent, sans sauter de cran.
             int ten = LgMonitor.PercentToRaw(10);
             Check(LgMonitor.RawToPercent(LgMonitor.NextStep(ten, 1)) == 12, "10 % + → 12 % (11,7)");
             Check(LgMonitor.RawToPercent(LgMonitor.NextStep(ten, -1)) == 9, "10 % − → 9 % (8,6)");
-
-            // Hors cran (après le mode auto) : on va au cran suivant ou précédent, sans sauter de cran.
             int t23 = LgMonitor.PercentToRaw(23);
-            Check(LgMonitor.RawToPercent(LgMonitor.NextStep(t23, 1)) == 25, "23 % + → 25 % (25,2)");
+            Check(LgMonitor.RawToPercent(LgMonitor.NextStep(t23, 1)) == 29, "23 % + → 29 % (29,3)");
             Check(LgMonitor.RawToPercent(LgMonitor.NextStep(t23, -1)) == 22, "23 % − → 22 % (21,6)");
 
             Check(LgMonitor.NextStep(LgMonitor.RawMax, 1) == LgMonitor.RawMax, "100 % + reste à 100 %");
