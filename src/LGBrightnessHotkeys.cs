@@ -1,6 +1,7 @@
 // LGBrightnessHotkeys : des raccourcis clavier (Ctrl + Volume +/- par défaut) règlent la luminosité
-// d'un LG UltraFine par pas de 5 %, en partant toujours de la valeur réelle lue sur l'écran (HID, rapport feature 0).
-// Compilation : csc (FrameworkArm64) /target:winexe /platform:anycpu /win32manifest:src\app.manifest, C# 5.
+// d'un LG UltraFine sur 32 crans, en partant toujours de la valeur réelle lue sur l'écran (HID, rapport feature 0).
+// En option, la luminosité suit le capteur de lumière ambiante de l'écran.
+// Compilation : voir build.ps1 (csc de .NET Framework, C# 5, métadonnées WinRT fournies avec Windows).
 using System;
 using System.Drawing;
 using System.Drawing.Drawing2D;
@@ -11,6 +12,10 @@ using System.Threading;
 using System.Windows.Forms;
 using Microsoft.Win32;
 using Microsoft.Win32.SafeHandles;
+using DeviceInformation = Windows.Devices.Enumeration.DeviceInformation;
+using DeviceInformationCollection = Windows.Devices.Enumeration.DeviceInformationCollection;
+using LightSensor = Windows.Devices.Sensors.LightSensor;
+using LightSensorReadingChangedEventArgs = Windows.Devices.Sensors.LightSensorReadingChangedEventArgs;
 
 // Le runtime ciblé ; l'exécution native ARM64 vient, elle, de <supportedArchitectures> dans app.manifest.
 [assembly: System.Runtime.Versioning.TargetFramework(".NETFramework,Version=v4.8.1")]
@@ -166,15 +171,152 @@ namespace LGBrightnessHotkeys
             return Math.Max(RawMin, (int)Math.Round(pct / 100.0 * RawMax));
         }
 
-        // Multiple de 5 suivant (dir > 0) ou précédent (dir < 0) ; une valeur à 0,25 % près d'un multiple compte comme ce multiple.
+        // 32 crans de RawMin à RawMax, chacun multipliant la luminosité par (54000 / 400)^(1/32) ≈ 1,166 :
+        // l'œil perçoit les écarts en relatif, donc des pas fins en bas et larges en haut (comme les 16 crans de macOS).
+        public const int Steps = 32;
+
+        public static int LevelRaw(int level)
+        {
+            return (int)Math.Round(RawMin * Math.Pow((double)RawMax / RawMin, (double)level / Steps));
+        }
+
+        // Valeur brute du cran suivant (dir > 0) ou précédent (dir < 0) ; à un quart de cran près, on est sur le cran.
         public static int NextStep(int raw, int dir)
         {
-            double pct = raw <= RawMin ? 0 : raw * 100.0 / RawMax;
+            double level = Math.Log(Math.Max(raw, 1) / (double)RawMin) / Math.Log((double)RawMax / RawMin) * Steps;
             const double tol = 0.25;
-            int target = dir > 0
-                ? ((int)Math.Floor((pct + tol) / 5) + 1) * 5
-                : ((int)Math.Ceiling((pct - tol) / 5) - 1) * 5;
-            return Math.Max(0, Math.Min(100, target));
+            int target = dir > 0 ? (int)Math.Floor(level + tol) + 1 : (int)Math.Ceiling(level - tol) - 1;
+            return LevelRaw(Math.Max(0, Math.Min(Steps, target)));
+        }
+    }
+
+    // Capteur de lumière ambiante de l'écran (« Capteur de lumière ambiante HID », pilote de Windows),
+    // lu par Windows.Devices.Sensors. Il n'envoie une mesure que quand la lumière change ; plage 0 à 4096 lux.
+    sealed class AmbientLight : IDisposable
+    {
+        readonly object gate = new object();
+        LightSensor sensor;
+        Windows.Foundation.TypedEventHandler<LightSensor, LightSensorReadingChangedEventArgs> handler;
+        double lux = double.NaN;
+
+        // Dernière mesure, NaN sans capteur. Les mesures arrivent sur un thread du système.
+        public double Lux { get { lock (gate) return lux; } }
+
+        public bool Found { get { return sensor != null; } }
+
+        public void Open()
+        {
+            Close();
+            try
+            {
+                LightSensor s = FindLgSensor();
+                if (s == null) return;
+                s.ReportInterval = Math.Max(s.MinimumReportInterval, 250u);
+                handler = (sender, e) => { double v = e.Reading.IlluminanceInLux; lock (gate) lux = v; };
+                s.ReadingChanged += handler;
+                sensor = s;
+                var reading = s.GetCurrentReading();
+                if (reading != null) lock (gate) lux = reading.IlluminanceInLux;
+            }
+            catch (Exception) { Close(); } // écran débranché pendant la recherche
+        }
+
+        public void Close()
+        {
+            if (sensor != null)
+            {
+                try { sensor.ReadingChanged -= handler; sensor.ReportInterval = 0; }
+                catch (Exception) { }
+                sensor = null;
+            }
+            lock (gate) lux = double.NaN;
+        }
+
+        public void Dispose() { Close(); }
+
+        static LightSensor FindLgSensor()
+        {
+            DeviceInformationCollection devices = Wait(DeviceInformation.FindAllAsync(LightSensor.GetDeviceSelector()));
+            if (devices == null) return null;
+            foreach (DeviceInformation d in devices)
+                if (d.Id.IndexOf("vid_043e", StringComparison.OrdinalIgnoreCase) >= 0) return Wait(LightSensor.FromIdAsync(d.Id));
+            return null;
+        }
+
+        // Attente bloquante (quelques dizaines de ms) : les opérations WinRT se terminent sur un autre thread.
+        static T Wait<T>(Windows.Foundation.IAsyncOperation<T> op) where T : class
+        {
+            DateTime until = DateTime.UtcNow.AddSeconds(3);
+            while (op.Status == Windows.Foundation.AsyncStatus.Started)
+            {
+                if (DateTime.UtcNow > until) { op.Cancel(); return null; }
+                Thread.Sleep(10);
+            }
+            return op.Status == Windows.Foundation.AsyncStatus.Completed ? op.GetResults() : null;
+        }
+    }
+
+    // Luminosité automatique : courbe lux → %, lissage de la mesure, et décalage appris des réglages manuels
+    // (« à cette lumière, je préfère 5 points de plus »).
+    sealed class AutoBrightness
+    {
+        // Courbe par défaut, interpolée sur log10(lux + 1) : l'œil perçoit la lumière de façon logarithmique.
+        static readonly double[] CurveLux = { 0, 10, 50, 100, 300, 1000, 3000 };
+        static readonly double[] CurvePct = { 5, 10, 20, 30, 50, 75, 100 };
+        public const int Threshold = 5;     // écart minimal, en points de %, avant de changer la luminosité
+        const int Window = 11;              // médiane des 11 dernières mesures, une par seconde
+
+        readonly double[] samples = new double[Window];
+        int count, next;
+        public double Offset;               // points de % ajoutés à la courbe
+
+        public bool HasLux { get { return count > 0; } }
+
+        // Médiane : une main devant le capteur ou un flash de moins de 5 s ne la déplace pas.
+        public double SmoothedLux
+        {
+            get
+            {
+                var sorted = new double[count];
+                Array.Copy(samples, sorted, count);
+                Array.Sort(sorted);
+                return sorted[count / 2];
+            }
+        }
+
+        public void Reset() { count = next = 0; }
+
+        public void AddSample(double lux)
+        {
+            samples[next] = Math.Max(0, lux);
+            next = (next + 1) % Window;
+            if (count < Window) count++;
+        }
+
+        public static double Curve(double lux)
+        {
+            double x = Math.Log10(Math.Max(0, lux) + 1);
+            for (int i = 1; i < CurveLux.Length; i++)
+            {
+                double x1 = Math.Log10(CurveLux[i] + 1);
+                if (x <= x1)
+                {
+                    double x0 = Math.Log10(CurveLux[i - 1] + 1);
+                    return CurvePct[i - 1] + (CurvePct[i] - CurvePct[i - 1]) * (x - x0) / (x1 - x0);
+                }
+            }
+            return CurvePct[CurvePct.Length - 1];
+        }
+
+        public int Target()
+        {
+            return Math.Max(0, Math.Min(100, (int)Math.Round(Curve(SmoothedLux) + Offset)));
+        }
+
+        // La luminosité choisie à la main devient la référence pour la lumière actuelle.
+        public void Learn(int pct)
+        {
+            if (HasLux) Offset = Math.Max(-100, Math.Min(100, pct - Curve(SmoothedLux)));
         }
     }
 
@@ -184,13 +326,22 @@ namespace LGBrightnessHotkeys
         public static readonly int OpenSettingsMessage = Native.RegisterWindowMessage("LGBrightnessHotkeys.OpenSettings");
         const int HotkeyUp = 1, HotkeyDown = 2;
         const int WriteSettleMs = 1000;
+        const int FadeSteps = 30;           // fondu de la luminosité auto : 30 pas de 50 ms
 
         readonly LgMonitor monitor = new LgMonitor();
         readonly NotifyIcon tray;
         readonly Icon trayIcon;
         readonly MessageWindow window;
         readonly Osd osd = new Osd();
-        readonly ToolStripMenuItem retryItem;
+        readonly ToolStripMenuItem retryItem, autoItem;
+        readonly AmbientLight light = new AmbientLight();
+        readonly AutoBrightness auto = new AutoBrightness();
+        readonly System.Windows.Forms.Timer autoTimer = new System.Windows.Forms.Timer { Interval = 1000 };
+        readonly System.Windows.Forms.Timer fadeTimer = new System.Windows.Forms.Timer { Interval = 50 };
+        bool autoEnabled, learnOnNextTick, sensorStale;
+        DateTime lastDeviceChange;
+        int expectedRaw = -1;               // dernière valeur connue de l'écran, pour repérer un réglage fait ailleurs
+        int fadeFromRaw, fadeToRaw, fadeStep;
         Hotkey upKey = Settings.Load(Settings.UpName, Hotkey.DefaultUp);
         Hotkey downKey = Settings.Load(Settings.DownName, Hotkey.DefaultDown);
         bool upRegistered, downRegistered, exiting;
@@ -206,6 +357,8 @@ namespace LGBrightnessHotkeys
             retryItem = new ToolStripMenuItem("Réactiver les raccourcis", null, delegate { RegisterHotkeys(true); });
             retryItem.Visible = false;
             menu.Items.Add(retryItem);
+            autoItem = new ToolStripMenuItem("Luminosité automatique", null, delegate { SetAuto(!autoEnabled, true); });
+            menu.Items.Add(autoItem);
             var settingsItem = new ToolStripMenuItem("Raccourcis…", null, delegate { OpenSettings(); });
             settingsItem.Font = new Font(settingsItem.Font, FontStyle.Bold); // action du double-clic
             menu.Items.Add(settingsItem);
@@ -219,7 +372,88 @@ namespace LGBrightnessHotkeys
 
             window = new MessageWindow(this);
             RegisterHotkeys(false);
+            autoTimer.Tick += delegate { AutoTick(); };
+            fadeTimer.Tick += delegate { FadeTick(); };
+            auto.Offset = Settings.LoadInt(Settings.AutoOffsetName, 0) / 10.0;
+            if (Settings.LoadInt(Settings.AutoName, 0) != 0) SetAuto(true, false);
             RefreshTooltip();
+        }
+
+        // Activée depuis le menu, la luminosité auto part de la luminosité actuelle ; au démarrage de Windows,
+        // elle reprend le décalage enregistré.
+        void SetAuto(bool on, bool fromMenu)
+        {
+            autoEnabled = on;
+            autoItem.Checked = on;
+            StopFade();
+            auto.Reset();
+            expectedRaw = -1;
+            if (on)
+            {
+                learnOnNextTick = fromMenu;
+                light.Open();
+                if (fromMenu && !light.Found)
+                    tray.ShowBalloonTip(6000, "Luminosité LG", "Capteur de lumière de l'écran introuvable. La luminosité automatique démarrera quand l'écran sera branché.", ToolTipIcon.Warning);
+                autoTimer.Start();
+                AutoTick();
+            }
+            else
+            {
+                autoTimer.Stop();
+                light.Close();
+            }
+            if (fromMenu) Settings.SaveInt(Settings.AutoName, on ? 1 : 0);
+            RefreshTooltip();
+        }
+
+        void AutoTick()
+        {
+            DateTime now = DateTime.UtcNow;
+            // Branchement ou débranchement : on rouvre le capteur une fois la rafale de notifications passée.
+            if (sensorStale && (now - lastDeviceChange).TotalSeconds >= 2) { sensorStale = false; light.Open(); }
+            double lux = light.Lux;
+            if (double.IsNaN(lux)) return;
+            auto.AddSample(lux);
+            if (fadeTimer.Enabled || (now - lastWriteTime).TotalMilliseconds < WriteSettleMs) return;
+
+            int raw;
+            if (!monitor.TryRead(out raw)) { expectedRaw = -1; return; }
+            int pct = LgMonitor.RawToPercent(raw);
+            // Activation depuis le menu, ou réglage fait par un autre logiciel : cette luminosité devient la référence.
+            if (learnOnNextTick || (expectedRaw >= 0 && Math.Abs(pct - LgMonitor.RawToPercent(expectedRaw)) >= 2))
+            {
+                learnOnNextTick = false;
+                LearnAuto(pct);
+            }
+            expectedRaw = raw;
+            int target = auto.Target();
+            if (Math.Abs(target - pct) >= AutoBrightness.Threshold) StartFade(raw, LgMonitor.PercentToRaw(target));
+        }
+
+        void LearnAuto(int pct)
+        {
+            auto.Learn(pct);
+            Settings.SaveInt(Settings.AutoOffsetName, (int)Math.Round(auto.Offset * 10));
+        }
+
+        void StartFade(int fromRaw, int toRaw)
+        {
+            fadeFromRaw = fromRaw;
+            fadeToRaw = toRaw;
+            fadeStep = 0;
+            fadeTimer.Start();
+        }
+
+        void StopFade() { fadeTimer.Stop(); }
+
+        void FadeTick()
+        {
+            fadeStep++;
+            int raw = fadeFromRaw + (int)Math.Round((fadeToRaw - fadeFromRaw) * (double)fadeStep / FadeSteps);
+            if (!monitor.TryWrite(raw)) { StopFade(); expectedRaw = -1; return; }
+            lastWrittenRaw = expectedRaw = raw;
+            lastWriteTime = DateTime.UtcNow;
+            if (fadeStep >= FadeSteps) { StopFade(); SetTooltip(LgMonitor.RawToPercent(raw)); }
         }
 
         void RegisterHotkeys(bool fromMenu)
@@ -288,18 +522,26 @@ namespace LGBrightnessHotkeys
         {
             int dir = id == HotkeyUp ? 1 : id == HotkeyDown ? -1 : 0;
             if (dir == 0) return;
+            StopFade();
             int raw;
             if (!monitor.TryRead(out raw)) { ShowNotFound(); return; }
             // L'écran ne renvoie la nouvelle valeur que 180 à 360 ms après une écriture : juste après
             // nos propres écritures (touche maintenue, appuis rapprochés), partir de la dernière valeur écrite.
             if (lastWrittenRaw >= 0 && (DateTime.UtcNow - lastWriteTime).TotalMilliseconds < WriteSettleMs) raw = lastWrittenRaw;
-            int pct = LgMonitor.NextStep(raw, dir);
-            int newRaw = LgMonitor.PercentToRaw(pct);
+            int newRaw = LgMonitor.NextStep(raw, dir);
+            int pct = LgMonitor.RawToPercent(newRaw);
             if (newRaw != raw)
             {
                 if (!monitor.TryWrite(newRaw)) { ShowNotFound(); return; }
                 lastWrittenRaw = newRaw;
                 lastWriteTime = DateTime.UtcNow;
+            }
+            if (autoEnabled)
+            {
+                // En mode auto, l'appui ne coupe rien : il règle la préférence pour la lumière actuelle.
+                learnOnNextTick = false;
+                LearnAuto(pct);
+                expectedRaw = newRaw;
             }
             SetTooltip(pct);
             osd.ShowLevel(pct);
@@ -309,6 +551,12 @@ namespace LGBrightnessHotkeys
         {
             monitor.Invalidate();
             lastWrittenRaw = -1;
+            if (autoEnabled)
+            {
+                sensorStale = true;
+                lastDeviceChange = DateTime.UtcNow;
+                expectedRaw = -1;
+            }
         }
 
         void ShowNotFound()
@@ -328,7 +576,13 @@ namespace LGBrightnessHotkeys
 
         void SetTooltip(int pct)
         {
-            tray.Text = "Luminosité LG : " + pct + " %";
+            string text = "Luminosité LG : " + pct + " %";
+            if (autoEnabled)
+            {
+                double lux = light.Lux;
+                text += double.IsNaN(lux) ? " (auto)" : " (auto, " + Math.Round(lux) + " lux)";
+            }
+            tray.Text = text;
             lastTooltipRefresh = DateTime.Now;
         }
 
@@ -337,6 +591,9 @@ namespace LGBrightnessHotkeys
             exiting = true;
             if (settingsForm != null) settingsForm.Close();
             UnregisterHotkeys();
+            autoTimer.Dispose();
+            fadeTimer.Dispose();
+            light.Dispose();
             tray.Visible = false;
             tray.Dispose();
             trayIcon.Dispose();
@@ -616,10 +873,12 @@ namespace LGBrightnessHotkeys
         }
     }
 
-    // Réglages dans HKCU\Software\LGBrightnessHotkeys (DWORD : modificateurs << 16 | touche).
+    // Réglages dans HKCU\Software\LGBrightnessHotkeys : raccourcis (DWORD : modificateurs << 16 | touche),
+    // luminosité auto activée (0/1) et décalage appris (dixièmes de point de %).
     static class Settings
     {
         public const string UpName = "HotkeyUp", DownName = "HotkeyDown";
+        public const string AutoName = "AutoBrightness", AutoOffsetName = "AutoOffset";
         const string KeyPath = @"Software\LGBrightnessHotkeys";
 
         public static Hotkey Load(string name, Hotkey fallback)
@@ -644,6 +903,30 @@ namespace LGBrightnessHotkeys
         {
             using (RegistryKey key = Registry.CurrentUser.CreateSubKey(KeyPath))
                 key.SetValue(name, h.Encode(), RegistryValueKind.DWord);
+        }
+
+        public static int LoadInt(string name, int fallback)
+        {
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(KeyPath))
+                {
+                    object value = key == null ? null : key.GetValue(name);
+                    if (value is int) return (int)value;
+                }
+            }
+            catch (Exception) { }
+            return fallback;
+        }
+
+        public static void SaveInt(string name, int value)
+        {
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.CreateSubKey(KeyPath))
+                    key.SetValue(name, value, RegistryValueKind.DWord);
+            }
+            catch (Exception) { } // préférence non enregistrée : sans gravité
         }
     }
 
